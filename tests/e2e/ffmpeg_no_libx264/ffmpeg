@@ -1,0 +1,19 @@
+#!/bin/sh
+# ffmpeg wrapper that hides the libx264 encoder.
+#
+# Used by the no-libx264 e2e run (tests/e2e/README.md) to prove that
+# YOMIRecord fails fast with a clear message when its chosen ffmpeg has no
+# encoder for the selected format, instead of handing the missing encoder
+# to ffmpeg and getting a silent failure.
+#
+# e2e.sh puts this file's directory first on PATH, so the mod's "ffmpeg"
+# lookup finds this wrapper before the real binary.
+set -eu
+REAL_FFMPEG=/usr/bin/ffmpeg
+for arg in "$@"; do
+  if [ "$arg" = "-encoders" ]; then
+    "$REAL_FFMPEG" "$@" | grep -v libx264
+    exit 0
+  fi
+done
+exec "$REAL_FFMPEG" "$@"

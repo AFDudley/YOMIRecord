@@ -1,0 +1,15 @@
+{
+  "author": "AFDudley",
+  "client_side": true,
+  "description": "End-to-end test driver for Your Only Move Is Record. Not for players.",
+  "friendly_name": "YOMIRecord E2E driver",
+  "id": "12345",
+  "link": "https://github.com/AFDudley/YOMIRecord",
+  "name": "YOMIRecordE2E",
+  "overwrites": false,
+  "priority": 0,
+  "requires": [
+    ""
+  ],
+  "version": "0.0.0"
+}
