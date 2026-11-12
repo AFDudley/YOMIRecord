@@ -7,6 +7,13 @@ signal recording_ended()
 
 const FRAME_SKIP = 10
 const END_BUFFER = 115
+# The ffmpeg encoder each recording format needs. post_recording() picks
+# the same mapping for the "-c:v" argument.
+const FORMAT_ENCODERS = {
+	"webm": "libvpx-vp9",
+	"avi": "mpeg4",
+	"mp4": "libx264",
+}
 
 var recording = false
 var rendering = false
@@ -655,6 +662,12 @@ func record():
 			return false
 		if ReplayManager.frames[1].size() == 0 or ReplayManager.frames[2].size() == 0:
 			spawn_text_toast("[color=#ff0000]Error![/color] There aren't any frames to record!", true)
+			return false
+		var format = options.get_option("recording_format")
+		var encoder_name = FORMAT_ENCODERS.get(format, FORMAT_ENCODERS["mp4"])
+		if not ffmpeg.has_encoder(encoder_name):
+			push_error("YOMIRecord: ffmpeg at %s has no %s encoder for the %s format" % [ffmpeg.ffmpeg_path, encoder_name, format])
+			spawn_text_toast("[color=#ff0000]Error![/color] Your ffmpeg has no %s encoder, so it cannot record %s. Install a full ffmpeg build." % [encoder_name, format], true)
 			return false
 		recording = true
 		if options.get_option("stable_mode"):

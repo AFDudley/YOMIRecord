@@ -4,6 +4,7 @@ signal download_status_changed()
 
 var ffmpeg_path = null
 var ffmpeg_can_fork = true
+var ffmpeg_encoders = PoolStringArray()
 var download_status = 0
 var download_failed = false
 var download_progress = 0
@@ -67,6 +68,22 @@ func list_files_in_directory(path):
 	dir.list_dir_end()
 	return files
 
+func list_encoders(ffmpeg):
+	var output = []
+	var exit_code = OS.execute(ffmpeg, ["-hide_banner", "-encoders"], true, output, false, false)
+	if exit_code != 0: return PoolStringArray()
+	var names = PoolStringArray()
+	var in_list = false
+	for line in output[0].split("\n"):
+		if line.begins_with(" ------"):
+			in_list = true
+			continue
+		if not in_list: continue
+		var fields = line.strip_edges().split(" ", false)
+		if fields.size() >= 2:
+			names.append(fields[1])
+	return names
+
 func check_for_binaries():
 	var available_paths = PoolStringArray([
 		BINARY_USER_PATH,
@@ -76,6 +93,7 @@ func check_for_binaries():
 	var file = File.new()
 
 	ffmpeg_path = null
+	ffmpeg_encoders = PoolStringArray()
 	for binary_path in available_paths:
 		if binary_path == BINARY_USER_PATH and not file.file_exists(BINARY_USER_PATH): continue
 		var version = get_version(binary_path)
@@ -86,8 +104,12 @@ func check_for_binaries():
 			break
 		if version != null:
 			ffmpeg_path = binary_path
+			ffmpeg_encoders = list_encoders(binary_path)
 			break
 		ffmpeg_can_fork = true
+
+func has_encoder(encoder_name: String) -> bool:
+	return ffmpeg_encoders.has(encoder_name)
 
 func using_downloaded_binary():
 	return ffmpeg_path == BINARY_USER_PATH
