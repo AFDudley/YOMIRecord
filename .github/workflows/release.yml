@@ -8,17 +8,23 @@ on:
 permissions:
   contents: write
 
+# `zip -r . ` used to run here and attach the result. The game's ModLoader
+# cannot load that zip: its files sit at the zip root, and it carries no
+# imported assets. ModLoader._checkMetadata needs "<ModName>/_metadata"
+# and ModLoader._checkFile needs a .tscn's referenced .png already
+# imported to a .stex. GitHub Actions has neither the game nor the
+# GodotSteam editor to produce those, so this job creates the tagged
+# release only. Attach the real zip by hand: run tools/build_release.sh
+# locally (see README.md, "Building a release zip") and upload its
+# output to the release this job creates.
 jobs:
-  build:
+  release:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v3
-      - name: Zip Folder
-        run: zip -r ${{ github.event.repository.name }}_${{ github.ref_name }}.zip . -x ".git/*" ".github/*" ".gitignore" "__preview.png" "__workshop_data.json"
       - name: Release
         uses: softprops/action-gh-release@v1
         with:
           name: ${{ github.ref_name }}
-          files: ${{ github.event.repository.name }}_${{ github.ref_name }}.zip
           generate_release_notes: true
