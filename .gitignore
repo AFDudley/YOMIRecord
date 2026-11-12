@@ -1,1 +1,3 @@
 *.import
+.scratch/
+.ruff_cache/

@@ -29,6 +29,7 @@ MOD_NAME = "YOMIRecord"
 EXCLUDE = {
     ".git",
     ".github",
+    ".ruff_cache",
     ".scratch",
     "tests",
     "tools",
