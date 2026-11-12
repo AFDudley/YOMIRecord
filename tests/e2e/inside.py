@@ -11,7 +11,9 @@ GodotSteam 3.5.1 editor build, Xvfb and ffmpeg. This script:
 4. waits for the driver mod's result, and probes each recording with ffprobe.
 
 Exit code 0 means one recording exists with a video and an audio stream, and
-the game log has no SCRIPT ERROR.
+the game log has no SCRIPT ERROR. In stable mode (E2E_STABLE=1) it also
+requires the audio and video durations to differ by at most 50 ms, and
+that ffmpeg trimmed no frames.
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
-
+import re
 import shutil
 import subprocess
 import sys
@@ -58,7 +60,7 @@ def probe(path: str) -> dict:
             "-v",
             "error",
             "-show_entries",
-            "format=duration:stream=codec_type,codec_name,width,height,nb_frames",
+            "format=duration:stream=codec_type,codec_name,width,height,nb_frames,duration",
             "-of",
             "json",
             path,
@@ -70,6 +72,36 @@ def probe(path: str) -> dict:
     if out.returncode != 0:
         return {"error": out.stderr.strip()}
     return json.loads(out.stdout)
+
+
+def recorded_frame_count(log_text: str) -> int | None:
+    m = re.search(r"YOMIRecord: Recorded (\d+) frames\.", log_text)
+    return int(m.group(1)) if m else None
+
+
+def duration_check(probe_result: dict, recorded_frames: int | None) -> dict | None:
+    """Compare the video and audio stream durations of one recording.
+
+    Returns None when either stream lacks a duration (so there is nothing
+    to compare), else a dict with the two durations in ms, their
+    difference, and whether ffmpeg trimmed frames from the video.
+    """
+    streams = probe_result.get("streams", [])
+    video = next((s for s in streams if s.get("codec_type") == "video"), None)
+    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    if not video or not audio or "duration" not in video or "duration" not in audio:
+        return None
+    video_ms = float(video["duration"]) * 1000.0
+    audio_ms = float(audio["duration"]) * 1000.0
+    video_frames = int(video.get("nb_frames", 0))
+    return {
+        "video_ms": video_ms,
+        "audio_ms": audio_ms,
+        "diff_ms": abs(video_ms - audio_ms),
+        "video_frames": video_frames,
+        "recorded_frames": recorded_frames,
+        "frames_trimmed": recorded_frames is not None and video_frames != recorded_frames,
+    }
 
 
 def main() -> int:
@@ -130,17 +162,30 @@ def main() -> int:
         "E2E_STABLE": args.stable,
         "E2E_RESULT": str(result_file),
     }
+    if args.stable == "1":
+        # Lockstep pacing (Recorder.gd's stable_record) holds AudioServer
+        # locked between video frames, so the shim's faster mixer sleep is
+        # safe here. Real-time mode must never get this: without lockstep
+        # pacing, the shimmed mixer runs about 10x real time and any
+        # real-time capture goes wrong.
+        env.update(rc.audio_shim_env(work.project))
     with log.open("w") as fh:
+        godot_args = [
+            str(work.godot),
+            "--path",
+            str(work.project),
+            "--audio-driver",
+            "Dummy",
+            "--resolution",
+            "1280x720",
+        ]
+        if args.stable == "1":
+            # Disables real-time sync, so the lockstep capture loop in
+            # Recorder.gd's stable_record() renders as fast as the CPU and
+            # GPU allow, instead of at the display's real-time pace.
+            godot_args += ["--fixed-fps", "60"]
         proc = subprocess.run(
-            [
-                str(work.godot),
-                "--path",
-                str(work.project),
-                "--audio-driver",
-                "Dummy",
-                "--resolution",
-                "1280x720",
-            ],
+            godot_args,
             stdout=fh,
             stderr=subprocess.STDOUT,
             env=env,
@@ -158,7 +203,18 @@ def main() -> int:
     ][:40]
     recordings = (report["driver"] or {}).get("recordings", [])
     report["probes"] = {r: probe(r) for r in recordings}
+    recorded_frames = recorded_frame_count(text)
+    report["duration_check"] = (
+        duration_check(report["probes"][recordings[0]], recorded_frames)
+        if args.stable == "1" and len(recordings) == 1
+        else None
+    )
     print(json.dumps(report, indent=2))
+
+    duration_ok = True
+    if args.stable == "1":
+        dc = report["duration_check"]
+        duration_ok = dc is not None and dc["diff_ms"] <= 50.0 and not dc["frames_trimmed"]
 
     ok = (
         len(recordings) == 1
@@ -167,6 +223,7 @@ def main() -> int:
             s["codec_type"] for s in report["probes"][recordings[0]].get("streams", [])
         }
         == {"video", "audio"}
+        and duration_ok
     )
     print("E2E", "PASS" if ok else "FAIL", f"log {log}")
     return 0 if ok else 1
