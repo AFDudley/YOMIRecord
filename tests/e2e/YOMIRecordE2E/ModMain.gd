@@ -53,14 +53,22 @@ func _run():
 		yield(tree, "idle_frame")
 
 	result.stage = "record"
+	# Phase timings: capture (recording_started -> recording_ending) and
+	# encode (recording_ending -> recording_ended: frame files and ffmpeg).
+	recorder.connect("recording_started", self, "_mark", ["capture_start_ms"])
+	recorder.connect("recording_ending", self, "_mark", ["capture_end_ms"])
 	recorder.connect("recording_ended", self, "_on_recording_ended")
 	tree.root.get_node(RECORD_BUTTON).emit_signal("pressed")
 	result.recording_started = recorder.recording
 	if !recorder.recording:
 		_finish()
 
+func _mark(key):
+	result[key] = OS.get_ticks_msec()
+
 func _on_recording_ended():
 	result.stage = "ended"
+	result.encode_end_ms = OS.get_ticks_msec()
 	var dir = Directory.new()
 	var files = []
 	if dir.open("user://recordings") == OK:

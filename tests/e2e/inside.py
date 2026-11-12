@@ -100,7 +100,8 @@ def duration_check(probe_result: dict, recorded_frames: int | None) -> dict | No
         "diff_ms": abs(video_ms - audio_ms),
         "video_frames": video_frames,
         "recorded_frames": recorded_frames,
-        "frames_trimmed": recorded_frames is not None and video_frames != recorded_frames,
+        "frames_trimmed": recorded_frames is not None
+        and video_frames != recorded_frames,
     }
 
 
@@ -129,6 +130,12 @@ def main() -> int:
     work = rc.Work(args.work.resolve())
     rc.prepare(work)
 
+    # ModLoader reads <real executable dir>/mods. If the binary is a link
+    # elsewhere (for example into a read-only Nix store), the zips below
+    # would be ignored and the game would wait in its menu until the timeout.
+    real_mods = Path(rc.os.path.realpath(work.godot)).parent / "mods"
+    if real_mods != MODS_DIR:
+        raise SystemExit(f"ModLoader reads {real_mods}, not {MODS_DIR}")
     MODS_DIR.mkdir(parents=True, exist_ok=True)
     if args.mod_src:
         build_zip.build(
@@ -147,21 +154,21 @@ def main() -> int:
     out.mkdir(parents=True)
     result_file = out / "result.json"
     log = out / "godot.log"
-    env = {
-        "PATH": (
-            f"{args.path_prepend.resolve()}:/usr/local/bin:/usr/bin:/bin"
-            if args.path_prepend
-            else "/usr/local/bin:/usr/bin:/bin"
-        ),
-        "DISPLAY": rc.os.environ["DISPLAY"],
-        "LD_LIBRARY_PATH": rc.os.environ["LD_LIBRARY_PATH"],
-        "HOME": str(out / "home"),
-        # Fresh user:// on every run (ModLoader's version gate, see replay_check).
-        "XDG_DATA_HOME": str(out / "xdg"),
-        "E2E_REPLAY": str(args.replay.resolve()),
-        "E2E_STABLE": args.stable,
-        "E2E_RESULT": str(result_file),
-    }
+    # Start from the image's environment: the Nix image sets the GL, EGL and
+    # library paths there (hustle's tools/replay_check/nix/image.nix).
+    env = dict(rc.os.environ)
+    if args.path_prepend:
+        env["PATH"] = f"{args.path_prepend.resolve()}:{env['PATH']}"
+    env.update(
+        {
+            "HOME": str(out / "home"),
+            # Fresh user:// on every run (ModLoader's version gate, see replay_check).
+            "XDG_DATA_HOME": str(out / "xdg"),
+            "E2E_REPLAY": str(args.replay.resolve()),
+            "E2E_STABLE": args.stable,
+            "E2E_RESULT": str(result_file),
+        }
+    )
     if args.stable == "1":
         # Lockstep pacing (Recorder.gd's stable_record) holds AudioServer
         # locked between video frames, so the shim's faster mixer sleep is
@@ -171,6 +178,8 @@ def main() -> int:
         env.update(rc.audio_shim_env(work.project))
     with log.open("w") as fh:
         godot_args = [
+            # vglrun when e2e.sh --gpu is set (REPLAY_CHECK_GPU=1).
+            *rc.godot_prefix(),
             str(work.godot),
             "--path",
             str(work.project),
@@ -209,12 +218,25 @@ def main() -> int:
         if args.stable == "1" and len(recordings) == 1
         else None
     )
+    # Phase timings from the driver. Capture starts at recording_started,
+    # which stable mode emits before it resets the replay, so the reset is
+    # in the capture time. Encode is the frame files plus ffmpeg.
+    drv = report["driver"] or {}
+    if recorded_frames and "capture_end_ms" in drv and "encode_end_ms" in drv:
+        capture_s = (drv["capture_end_ms"] - drv["capture_start_ms"]) / 1000
+        report["timing"] = {
+            "capture_s": capture_s,
+            "encode_s": (drv["encode_end_ms"] - drv["capture_end_ms"]) / 1000,
+            "capture_speed": round(recorded_frames / 60 / capture_s, 2),
+        }
     print(json.dumps(report, indent=2))
 
     duration_ok = True
     if args.stable == "1":
         dc = report["duration_check"]
-        duration_ok = dc is not None and dc["diff_ms"] <= 50.0 and not dc["frames_trimmed"]
+        duration_ok = (
+            dc is not None and dc["diff_ms"] <= 50.0 and not dc["frames_trimmed"]
+        )
 
     ok = (
         len(recordings) == 1

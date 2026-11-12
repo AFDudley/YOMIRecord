@@ -6,8 +6,9 @@ a working video file. It runs inside podman, against hustle's
 
 ## What it does
 
-1. `tests/e2e/e2e.sh` builds the `localhost/hustle-replay-check` image from
-   the hustle repo, then runs `tests/e2e/inside.py` inside it.
+1. `tests/e2e/e2e.sh` builds the `localhost/hustle-replay-check` image with
+   the hustle repo's `tools/replay_check/build.sh` (a Nix build that runs
+   in a container), then runs `tests/e2e/inside.py` inside it.
 2. `inside.py` prepares an imported copy of the game
    (hustle's `replay_check.prepare()`), builds the YOMIRecord mod zip with
    `tools/build_zip.py`, and zips the driver mod
@@ -78,7 +79,7 @@ then take the difference. Speed is
 ## Running it
 
 ```
-tests/e2e/e2e.sh <hustle repo> <replay file> <stable 0|1> [--mod-zip ZIP] [--ffmpeg-wrapper DIR]
+tests/e2e/e2e.sh <hustle repo> <replay file> <stable 0|1> [--mod-zip ZIP] [--ffmpeg-wrapper DIR] [--gpu CDI_DEVICE]
 ```
 
 - `<hustle repo>` is a local checkout of the game.
@@ -92,6 +93,10 @@ tests/e2e/e2e.sh <hustle repo> <replay file> <stable 0|1> [--mod-zip ZIP] [--ffm
   hold an executable file named `ffmpeg`. `tests/e2e/ffmpeg_no_libx264`
   holds a wrapper that hides the `libx264` encoder, to test YOMIRecord's
   encoder check (see "Testing the missing-encoder case" below).
+- `--gpu CDI_DEVICE` passes one GPU into the container (a name from
+  `nvidia-ctk cdi list`). The game then renders on it through VirtualGL
+  (`vglrun -d egl`). Stable mode turns vsync off while it records: with
+  vsync on, the GPU run was capped at the display rate.
 
 Each run writes its log and result to
 `.scratch/e2e/run_stable<N>[_no_ffmpeg_encoder]/`:
