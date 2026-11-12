@@ -18,6 +18,7 @@ const FORMAT_ENCODERS = {
 var recording = false
 var rendering = false
 var record_effect: AudioEffectRecord
+var capture_effect: AudioEffectCapture
 var record_effect_bus_index = -1
 var recording_id = -1
 var recording_bus_volume = 0
@@ -28,6 +29,7 @@ var recording_show_playback_controls = false
 var stable_recording = false
 var writer_finished = false
 var stable_recording_state
+var captured_audio = PoolVector2Array()
 
 var thread_counter_current:int = 0
 var thread_counter_final:int = 0
@@ -256,13 +258,6 @@ func hide_rendering_toast():
 		rendering_toast.queue_free()
 	rendering_toast = null
 
-func show_audio_recording_overlay(frames: int):
-	set_yomirecord_overlay_visible(true)
-	var overlay: MarginContainer = get_yomirecord_layer().get_node("Overlay/RenderingOverlay")
-	overlay.get_node("HContainer/Detail").text = "Recording audio for %d frames..." % frames
-	overlay.get_node("HContainer/FrameWarn").visible = false
-	overlay.visible = true
-
 func hide_rendering_overlay():
 	var overlay: MarginContainer = get_yomirecord_layer().get_node("Overlay/RenderingOverlay")
 	overlay.visible = false
@@ -314,7 +309,40 @@ func _remove_record_effect():
 	record_effect = null
 	record_effect_bus_index = -1
 
-func _begin_recording():
+func _add_capture_effect():
+	var bus_name = "Fx" if options.get_option("record_fx_only") else "Master"
+	record_effect_bus_index = AudioServer.get_bus_index(bus_name)
+	capture_effect = AudioEffectCapture.new()
+	capture_effect.buffer_length = 2.0
+	AudioServer.add_bus_effect(record_effect_bus_index, capture_effect)
+	print("YOMIRecord: Recording audio from the %s bus" % bus_name)
+
+func _remove_capture_effect():
+	if capture_effect == null or record_effect_bus_index < 0: return
+	for effect_index in range(AudioServer.get_bus_effect_count(record_effect_bus_index)):
+		if AudioServer.get_bus_effect(record_effect_bus_index, effect_index) == capture_effect:
+			AudioServer.remove_bus_effect(record_effect_bus_index, effect_index)
+			break
+	capture_effect = null
+	record_effect_bus_index = -1
+
+func _write_stable_audio(path: String):
+	# Pack the captured float samples as 16-bit PCM and save a wav.
+	# StreamPeerBuffer.put_16 writes a little-endian signed sample, so
+	# this needs no manual byte-order or two's-complement work.
+	var buffer = StreamPeerBuffer.new()
+	for sample in captured_audio:
+		buffer.put_16(int(clamp(sample.x, -1.0, 1.0) * 32767.0))
+		buffer.put_16(int(clamp(sample.y, -1.0, 1.0) * 32767.0))
+	var stream = AudioStreamSample.new()
+	stream.format = AudioStreamSample.FORMAT_16_BITS
+	stream.stereo = true
+	stream.mix_rate = int(AudioServer.get_mix_rate())
+	stream.data = buffer.data_array
+	stream.save_to_wav(path)
+	captured_audio = PoolVector2Array()
+
+func _begin_recording(stable: bool = false):
 	emit_signal("recording_starting")
 
 	# Hide Layers
@@ -330,7 +358,10 @@ func _begin_recording():
 	# Handle Audio and Record Audio Effect
 	recording_bus_volume = AudioServer.get_bus_volume_db(AudioServer.get_bus_index("Fx"))
 	if not options.get_option("mute_audio"):
-		_add_record_effect()
+		if stable:
+			_add_capture_effect()
+		else:
+			_add_record_effect()
 
 	# Prepare Directory
 	recording_id = randi() % 10000000
@@ -370,7 +401,7 @@ func _wait_for_replay_reset(previous_game):
 	while not is_instance_valid(Global.current_game) or Global.current_game == previous_game or not Global.current_game.game_started:
 		yield (get_tree(), "idle_frame")
 
-func _reset_stable_playback(manual: bool):
+func _reset_stable_playback():
 	Global.frame_advance = true
 	var previous_game = Global.current_game
 	reset_playback()
@@ -379,7 +410,7 @@ func _reset_stable_playback(manual: bool):
 		yield (reset_state, "completed")
 	Global.current_game.advance_frame_input = false
 	if Global.current_game.get("real_tick") != null: Global.current_game.real_tick = 0
-	Global.current_game.set_physics_process(not manual)
+	Global.current_game.set_physics_process(false)
 	Global.frame_advance = false
 
 func _capture_recording_frame():
@@ -415,26 +446,51 @@ func _run_ffmpeg(data):
 
 func stable_record():
 	# Pre-recording
-	var begin_state = _begin_recording()
+	var begin_state = _begin_recording(true)
 	if begin_state is GDScriptFunctionState:
 		yield (begin_state, "completed")
 	emit_signal("recording_started")
 
 	# Setup the game
 	_set_recording_speed()
-	var reset_state = _reset_stable_playback(true)
+	var reset_state = _reset_stable_playback()
 	if reset_state is GDScriptFunctionState:
 		yield (reset_state, "completed")
 	var game = Global.current_game
 
-	# Frame by frame recording
+	var audio_muted = options.get_option("mute_audio")
+	var mix_rate = int(AudioServer.get_mix_rate())
+	var audio_captured = 0
+	captured_audio = PoolVector2Array()
+	if not audio_muted:
+		AudioServer.set_bus_volume_db(AudioServer.get_bus_index("Fx"), default_recording_bus_volume)
+
+	# Frame by frame recording, one pass. AudioServer stays locked while
+	# the frame's physics step and draw run, so the mixer only advances
+	# between video frames. After each frame this drains the capture bus
+	# until it holds exactly as many samples as the video has played, so
+	# the audio clock cannot drift from the video clock.
+	# See tests/e2e/README.md, "Stable mode audio".
 	var video_end_buffer = END_BUFFER
 	while recording:
+		if not audio_muted:
+			AudioServer.lock()
 		game._physics_process(1.0 / 60.0)
 		yield (get_tree(), "idle_frame")
 		yield (VisualServer, "frame_post_draw")
 
 		_capture_recording_frame()
+
+		if not audio_muted:
+			AudioServer.unlock()
+			var needed = recording_frames.size() * mix_rate / 60
+			while audio_captured < needed:
+				var available = capture_effect.get_frames_available()
+				if available > 0:
+					captured_audio.append_array(capture_effect.get_buffer(available))
+					audio_captured += available
+				else:
+					OS.delay_usec(50)
 
 		if not ReplayManager.playback and game.is_waiting_on_player() and not game.game_finished:
 			break
@@ -447,31 +503,7 @@ func stable_record():
 	# Restore game
 	game.set_physics_process(true)
 	var frames_length = recording_frames.size()
-	var audio_muted = options.get_option("mute_audio")
 	print("YOMIRecord: Recorded %d frames." % frames_length)
-
-	# Record audio
-	if not audio_muted:
-		show_audio_recording_overlay(frames_length)
-		AudioServer.set_bus_volume_db(AudioServer.get_bus_index("Fx"), default_recording_bus_volume)
-
-		reset_state = _reset_stable_playback(false)
-		if reset_state is GDScriptFunctionState:
-			yield (reset_state, "completed")
-
-		record_effect.set_recording_active(true)
-		var audio_end_buffer = END_BUFFER
-		while true:
-			yield (get_tree(), "physics_frame")
-			yield (get_tree(), "idle_frame")
-			if not ReplayManager.playback and Global.current_game.is_waiting_on_player() and not Global.current_game.game_finished:
-				break
-			if Global.current_game.game_finished:
-				if audio_end_buffer > 0:
-					audio_end_buffer -= 1
-				else:
-					break
-		record_effect.set_recording_active(false)
 
 	# post record (this also waits for the worker thread)
 	var post_state = post_recording()
@@ -505,9 +537,12 @@ func post_recording():
 
 	# Save Audio Recording
 	if not audio_muted:
-		record_effect.set_recording_active(false)
-		var recording_stream = record_effect.get_recording()
-		recording_stream.save_to_wav("%s/audio.wav" % local_path)
+		if stable_recording:
+			_write_stable_audio("%s/audio.wav" % local_path)
+		else:
+			record_effect.set_recording_active(false)
+			var recording_stream = record_effect.get_recording()
+			recording_stream.save_to_wav("%s/audio.wav" % local_path)
 
 	print("YOMIRecord: Writing frames to %s ..." % local_path)
 	OS.set_window_title("Your Only Move Is HUSTLE (Rendering)")
@@ -640,7 +675,10 @@ func post_recording():
 	recording_frame_skip = FRAME_SKIP
 	recording_end_buffer = END_BUFFER
 	AudioServer.set_bus_volume_db(AudioServer.get_bus_index("Fx"), recording_bus_volume)
-	_remove_record_effect()
+	if stable_recording:
+		_remove_capture_effect()
+	else:
+		_remove_record_effect()
 	
 	OS.set_window_title("Your Only Move Is HUSTLE")
 	change_window_icon("normal")
