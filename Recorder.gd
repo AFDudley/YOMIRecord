@@ -472,6 +472,11 @@ func stable_record():
 	# the audio clock cannot drift from the video clock.
 	# See tests/e2e/README.md, "Stable mode audio".
 	var video_end_buffer = END_BUFFER
+	# Stable mode steps the game itself, so vsync only slows it down. With a
+	# GPU, vsync capped each frame at the display refresh (measured 60.0 fps
+	# with an RTX 5070; 252 fps with vsync off). Restored after the loop.
+	var vsync_was_enabled = OS.vsync_enabled
+	OS.vsync_enabled = false
 	while recording:
 		if not audio_muted:
 			AudioServer.lock()
@@ -501,6 +506,7 @@ func stable_record():
 				break
 
 	# Restore game
+	OS.vsync_enabled = vsync_was_enabled
 	game.set_physics_process(true)
 	var frames_length = recording_frames.size()
 	print("YOMIRecord: Recorded %d frames." % frames_length)
