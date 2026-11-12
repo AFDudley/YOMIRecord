@@ -2,7 +2,11 @@
 # Run the YOMIRecord end-to-end test in podman. See tests/e2e/README.md.
 #
 # Usage: tests/e2e/e2e.sh <hustle repo> <replay> <stable 0|1> \
-#   [--mod-zip ZIP] [--ffmpeg-wrapper DIR]
+#   [--mod-zip ZIP] [--ffmpeg-wrapper DIR] [--gpu CDI_DEVICE]
+#
+# --gpu passes one GPU (a CDI name from `nvidia-ctk cdi list`) into the
+# container, and the game renders on it through VirtualGL (hustle's
+# tools/replay_check/README.md, "GPU rendering").
 #
 # The image is hustle's tools/replay_check image (container.sh builds it).
 # Mounts use the same absolute paths inside and outside the container:
@@ -18,6 +22,7 @@ shift 3
 mod_args=(--mod-src "$repo")
 extra_args=()
 mounts=()
+gpu=()
 out_suffix=""
 while (($#)); do
   case "$1" in
@@ -25,6 +30,12 @@ while (($#)); do
     zip="$(realpath "$2")"
     mod_args=(--mod-zip "$zip")
     mounts+=(-v "$zip:$zip:ro")
+    shift 2
+    ;;
+  --gpu)
+    # Same GPU settings as hustle's tools/replay_check/container.sh --gpu.
+    gpu=(--device "$2" -e REPLAY_CHECK_GPU=1 -e VGL_READBACK=none -e __GL_YIELD=USLEEP)
+    out_suffix="${out_suffix}_gpu"
     shift 2
     ;;
   --ffmpeg-wrapper)
@@ -42,9 +53,9 @@ done
 
 scratch="$repo/.scratch/e2e"
 mkdir -p "$scratch"
-podman build --quiet --tag localhost/hustle-replay-check \
-  --file "$hustle/tools/replay_check/Containerfile" "$hustle/tools/replay_check" > /dev/null
-exec podman run --rm --init \
+# hustle builds its image with Nix and loads it as localhost/hustle-replay-check.
+"$hustle/tools/replay_check/build.sh" > /dev/null
+exec podman run --rm --init "${gpu[@]}" \
   -v "$repo:$repo:ro" -v "$hustle:$hustle:ro" -v "$scratch:$scratch" \
   -v "$replay:$replay:ro" "${mounts[@]}" \
   --entrypoint python3 localhost/hustle-replay-check \

@@ -17,8 +17,8 @@ dest="$(realpath -m "$2")"
 work="$repo/.scratch/release/work"
 mkdir -p "$work" "$(dirname "$dest")"
 
-podman build --quiet --tag localhost/hustle-replay-check \
-  --file "$hustle/tools/replay_check/Containerfile" "$hustle/tools/replay_check" > /dev/null
+# hustle builds its image with Nix and loads it as localhost/hustle-replay-check.
+"$hustle/tools/replay_check/build.sh" > /dev/null
 exec podman run --rm --init \
   -v "$repo:$repo:ro" -v "$hustle:$hustle:ro" \
   -v "$work:$work" -v "$(dirname "$dest"):$(dirname "$dest")" \
