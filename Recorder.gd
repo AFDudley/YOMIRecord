@@ -749,21 +749,36 @@ func post_recording():
 	if exit_code == 0:
 		var ffmpegExtraArgs = PoolStringArray()
 		if not audio_muted:
+			# ffmpeg only honors the last "-af"/"-filter:a" it is given; it
+			# does not chain repeated ones. So every audio filter this mod
+			# can add -- volume, normalize, the exact-length pad/trim, and
+			# the speed pitch shift -- has to be one comma-joined chain
+			# behind a single "-af", not separate flags.
+			var audio_filters = PoolStringArray()
 			var volume = float(options.get_option("volume")) / 100
 			if volume != 1:
-				ffmpegExtraArgs.append_array([
-					"-filter:a", "volume=%.2f" % volume
-				])
+				audio_filters.append("volume=%.2f" % volume)
 			if options.get_option("normalize_audio"):
-				ffmpegExtraArgs.append_array([
-					"-filter:a", "dynaudnorm"
-				])
+				audio_filters.append("dynaudnorm")
+			# Pad (if real-time capture ran short) or trim (stable mode's
+			# lockstep capture can run a little long) the audio to exactly
+			# the sample count the video's frame count implies, instead of
+			# "-shortest", which only cuts at the shorter container's EOF
+			# and left a constant ~20 ms shortfall in every stable-mode
+			# recording (see tests/e2e/README.md, "Audio length"). This
+			# runs before the speed filter below, so that filter scales an
+			# already-exact-length signal instead of compounding its own
+			# rounding on top of whatever length capture produced.
+			var mix_rate = int(AudioServer.get_mix_rate())
+			var target_samples = int(round(float(frames_length) * mix_rate / 60.0))
+			audio_filters.append("apad")
+			audio_filters.append("atrim=end_sample=%d" % target_samples)
 			var framerate = _recording_framerate()
 			# https://superuser.com/a/1667260
 			if framerate != 60:
-				ffmpegExtraArgs.append_array([
-					"-af", "asetrate=44100*%s,aresample=44100" % str(float(framerate) / 60)
-				])
+				audio_filters.append("asetrate=44100*%s" % str(float(framerate) / 60))
+				audio_filters.append("aresample=44100")
+			ffmpegExtraArgs.append_array(["-af", audio_filters.join(",")])
 
 		var ffmpegArgs = PoolStringArray(["-i", video_only_path])
 		if audio_muted:
@@ -772,8 +787,7 @@ func post_recording():
 			ffmpegArgs.append_array([
 				"-i", "%s/audio.wav" % _global_path(),
 				"-map", "0:v",
-				"-map", "1:a",
-				"-shortest"
+				"-map", "1:a"
 			])
 		ffmpegArgs.append_array([
 			"-c:v", "copy",

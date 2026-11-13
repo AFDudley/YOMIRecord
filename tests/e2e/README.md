@@ -69,6 +69,26 @@ unaffected). Passing an explicit level makes libx264 clip the
 reference-frame count down to what that level allows, instead of
 raising the level to fit the preset.
 
+## Audio length
+
+The finalize pass used to add `-shortest` and let that trim whichever
+stream was longer. That only cuts at the shorter stream's end of file,
+not at an exact sample, and it left a constant ~20 ms audio shortfall
+in every stable-mode recording: a 2045-frame, 60 fps recording needs
+1,503,075 audio samples (`2045 * 44100 / 60`), but the captured WAV
+(1,503,232 samples, slightly long, as stable mode's lockstep capture
+normally is) muxed with `-shortest` came out at 1,502,178 samples, not
+1,503,075.
+
+`post_recording()` now pads (`apad`, for real-time mode, whose capture
+can run short) and trims (`atrim=end_sample=N`) the audio to exactly
+`frames * mix_rate / 60` samples, in the same `-af` chain as the volume
+and normalize filters, before any speed-driven pitch shift. The
+remaining gap is AAC's own encoder frame size (1024 samples) and
+priming delay, not this mod's trim: the same mux with `atrim` instead
+of `-shortest` measured 1,503,060 samples against a target of
+1,503,075 (15 samples, 0.34 ms, short).
+
 ## Stable mode audio
 
 Stable mode (`options.stable_mode`) steps the game by hand to capture video
@@ -155,9 +175,11 @@ hold:
 - `ffprobe` finds both a video stream and an audio stream in that
   recording.
 - In stable mode (`<stable 0|1>` is `1`) only: the video and audio stream
-  durations, from `ffprobe`, differ by at most 50 ms, and the video's
+  durations, from `ffprobe`, differ by at most 2 ms, and the video's
   `nb_frames` matches the `YOMIRecord: Recorded N frames.` log line. This
-  is `report.duration_check` in the printed JSON.
+  is `report.duration_check` in the printed JSON, which also reports the
+  audio stream's exact sample count against the count the video's frame
+  count implies (`audio_samples`, `expected_audio_samples`).
 
 Any other outcome prints `E2E FAIL` and exits 1. The printed JSON report
 says why: check `driver.stage` for where the driver mod stopped, and
