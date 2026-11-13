@@ -27,6 +27,36 @@ a working video file. It runs inside podman, against hustle's
    `SCRIPT ERROR` lines from the log, and the `ffprobe` output for each
    recording.
 
+
+## Encode pipeline
+
+`Recorder.gd` streams video straight to ffmpeg instead of saving a PNG
+per frame. `_start_video_encoder()` starts ffmpeg before capture, with a
+`rawvideo` input that connects, as a TCP client, to a loopback socket
+Godot already has listening (`_open_video_server()`). The writer thread
+sends each captured frame's raw RGBA bytes over that socket as it is
+captured, instead of calling `Image.save_png()`. Godot listens and
+ffmpeg connects, not the reverse: hustle's `tools/botplay/Render.gd` has
+ffmpeg listen and Godot connect, which works there because an outside
+process (`run.py`) starts ffmpeg before Godot. This mod starts ffmpeg
+itself, so Godot has to be the side already listening, or the connection
+would race the launch.
+
+ffmpeg encodes the video while capture is still running, to a video-only
+file in the same container as the chosen format (`video_only.mp4`,
+`.webm` or `.avi`). After capture ends, `post_recording()` waits for
+that encode to finish (usually a short wait, since most of the encode
+already happened), then runs a second, fast ffmpeg pass that adds the
+audio track with `-c:v copy` (a container remux, not a second video
+encode) and writes the metadata tags. This split is why `tests/e2e/inside.py`
+reports two separate phases (see "Measuring stable-mode speed" below):
+`capture_s` now includes most of the video encode, and `encode_s` is
+mostly the audio remux.
+
+No per-frame image files exist in this pipeline, on disk or otherwise:
+`options.skip_files` now keeps the temporary `audio.wav` (and, if the
+video encode fails, a partial `video_only.*`) instead of PNG frames.
+
 ## Stable mode audio
 
 Stable mode (`options.stable_mode`) steps the game by hand to capture video

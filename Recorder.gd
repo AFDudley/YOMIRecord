@@ -15,6 +15,14 @@ const FORMAT_ENCODERS = {
 	"mp4": "libx264",
 }
 
+# Loopback host the video encoder's TCP socket uses. Only this mod
+# connects to it, so loopback is always reachable and needs no firewall
+# exception on Windows.
+const VIDEO_HOST = "127.0.0.1"
+# How long to wait for ffmpeg to connect to the video socket before
+# failing the recording instead of hanging it.
+const VIDEO_CONNECT_TIMEOUT_MS = 10000
+
 var recording = false
 var rendering = false
 var record_effect: AudioEffectRecord
@@ -35,6 +43,10 @@ var thread_counter_current:int = 0
 var thread_counter_final:int = 0
 var writer_thread:Thread
 var writer_thread_semaphore:Semaphore = Semaphore.new()
+var video_port = -1
+var video_server: TCP_Server
+var video_ffmpeg_thread: Thread
+var video_write_failed = false
 var rendering_toast = null
 
 var default_recording_bus_volume = -0.130497
@@ -355,6 +367,21 @@ func _begin_recording(stable: bool = false):
 	yield (get_tree(), "idle_frame")
 	yield (get_tree(), "idle_frame")
 
+	# Prepare the recording directory and the video encoder's TCP
+	# listener before touching audio, so a failure here needs no audio
+	# cleanup.
+	recording_id = randi() % 10000000
+	video_write_failed = false
+	video_server = _open_video_server()
+	if video_server == null:
+		set_ui_visibility(true)
+		set_yomirecord_overlay_visible(true)
+		spawn_text_toast("[color=#ff0000]Error![/color] Could not open the recorder's video socket. Try again.", true)
+		recording = false
+		return
+	Directory.new().make_dir(_local_path())
+	_start_video_encoder()
+
 	# Handle Audio and Record Audio Effect
 	recording_bus_volume = AudioServer.get_bus_volume_db(AudioServer.get_bus_index("Fx"))
 	if not options.get_option("mute_audio"):
@@ -363,14 +390,10 @@ func _begin_recording(stable: bool = false):
 		else:
 			_add_record_effect()
 
-	# Prepare Directory
-	recording_id = randi() % 10000000
-	var local_path = "user://yomirecord/_recording_%d" % recording_id
-
-	# Start writer thread
-	Directory.new().make_dir(local_path)
+	# Start writer thread: it feeds the video encoder over the socket
+	# _start_video_encoder() connected it to.
 	writer_thread = Thread.new()
-	writer_thread.start(self, "_thread_write", local_path, 0)
+	writer_thread.start(self, "_thread_write", video_server, 0)
 
 	# Window Stuff
 	OS.set_window_title("Your Only Move Is HUSTLE (Recording)")
@@ -443,6 +466,94 @@ func _run_ffmpeg(data):
 	var output = []
 	var exit_code = OS.execute(data[0], data[1], true, output, true, data[2])
 	return [exit_code, output]
+
+func _local_path() -> String:
+	return "user://yomirecord/_recording_%d" % recording_id
+
+func _global_path() -> String:
+	return ProjectSettings.globalize_path(_local_path())
+
+func _video_only_path(format: String) -> String:
+	return "%s/video_only.%s" % [_global_path(), format]
+
+# Same codec and preset post_recording() used to pass to ffmpeg. The
+# "-c:v" name here must match FORMAT_ENCODERS, which record() checks
+# before it lets a recording start.
+func _video_codec_args(format: String) -> PoolStringArray:
+	if format == "webm":
+		return PoolStringArray(["-c:v", "libvpx-vp9"])
+	elif format == "avi":
+		return PoolStringArray(["-c:v", "mpeg4"])
+	return PoolStringArray(["-c:v", "libx264", "-preset", "veryslow"])
+
+func _recording_resolution_size() -> String:
+	var resolution = int(options.get_option("resolution"))
+	var res_size = "640x360"
+	if resolution != 360:
+		var resolution_scale = float(resolution) / float(get_viewport().size.y)
+		res_size = "%dx%d" % [int(ceil(get_viewport().size.x * resolution_scale)), int(get_viewport().size.y * resolution_scale)]
+		if resolution == 480: res_size = "854x480"
+	return res_size
+
+func _recording_framerate() -> int:
+	var framerate = 60
+	if get_native_speed() == null:
+		framerate = int(float(60) * options.get_option("speed"))
+		if framerate <= 0: framerate = 1
+	return framerate
+
+# Opens the TCP listener the video encoder connects to. Godot listens and
+# ffmpeg connects to it, not the reverse: this mod launches ffmpeg itself
+# (unlike hustle's tools/botplay, where an outside process starts ffmpeg
+# before Godot), so Godot must be the side already listening, or
+# ffmpeg's connection would race the launch.
+func _open_video_server() -> TCP_Server:
+	var server = TCP_Server.new()
+	video_port = 40000 + (recording_id % 20000)
+	var err = server.listen(video_port, VIDEO_HOST)
+	if err != OK:
+		push_error("YOMIRecord: could not listen on %s:%d for the video encoder (error %d)" % [VIDEO_HOST, video_port, err])
+		return null
+	return server
+
+# Waits for ffmpeg to connect, with a bounded timeout so a broken ffmpeg
+# launch fails the recording instead of hanging it.
+func _accept_video_connection(server: TCP_Server) -> StreamPeerTCP:
+	var waited_ms = 0
+	while not server.is_connection_available():
+		if waited_ms >= VIDEO_CONNECT_TIMEOUT_MS:
+			push_error("YOMIRecord: ffmpeg did not connect to the video encoder within %d ms" % VIDEO_CONNECT_TIMEOUT_MS)
+			return null
+		OS.delay_msec(10)
+		waited_ms += 10
+	return server.take_connection()
+
+# Starts the video encoder before capture begins, so it encodes frames as
+# they arrive instead of after the whole recording is captured. It
+# writes a video-only file; post_recording() adds the audio track
+# afterwards with a fast "-c:v copy" remux. See tests/e2e/README.md,
+# "Encode pipeline".
+func _start_video_encoder():
+	var format = options.get_option("recording_format")
+	var viewport_size = get_game_viewport().size
+	var res_size = _recording_resolution_size()
+	var framerate = _recording_framerate()
+	var ffmpegArgs = PoolStringArray([
+		"-f", "rawvideo",
+		"-pix_fmt", "rgba",
+		"-video_size", "%dx%d" % [int(viewport_size.x), int(viewport_size.y)],
+		"-framerate", str(framerate),
+		"-i", "tcp://%s:%d" % [VIDEO_HOST, video_port],
+		"-pix_fmt", "yuv420p",
+		"-vf", "vflip",
+		"-s", res_size,
+		"-sws_flags", "neighbor",
+	])
+	ffmpegArgs.append_array(_video_codec_args(format))
+	ffmpegArgs.append(_video_only_path(format))
+	print("YOMIRecord: starting video encoder with command: ", ffmpegArgs)
+	video_ffmpeg_thread = Thread.new()
+	video_ffmpeg_thread.start(self, "_run_ffmpeg", [ffmpeg.ffmpeg_path, ffmpegArgs, options.get_option("exec_console")])
 
 func stable_record():
 	# Pre-recording
@@ -520,14 +631,12 @@ func post_recording():
 	recording = false
 	rendering = true
 	emit_signal("recording_ending")
-	var local_path = "user://yomirecord/_recording_%d" % recording_id
 	var audio_muted = options.get_option("mute_audio")
 
 	# Get the usernames so the player can go elsewhere
-	var global_path = ProjectSettings.globalize_path(local_path)
 	var usernames = get_player_names()
 	var video_name = Utils.filter_filename(ReplayManager.generate_mp_replay_name(usernames[0], usernames[1]))
-	
+
 	# Show Layers
 	var frames_length = recording_frames.size()
 	set_yomirecord_overlay_visible(true)
@@ -544,13 +653,13 @@ func post_recording():
 	# Save Audio Recording
 	if not audio_muted:
 		if stable_recording:
-			_write_stable_audio("%s/audio.wav" % local_path)
+			_write_stable_audio("%s/audio.wav" % _local_path())
 		else:
 			record_effect.set_recording_active(false)
 			var recording_stream = record_effect.get_recording()
-			recording_stream.save_to_wav("%s/audio.wav" % local_path)
+			recording_stream.save_to_wav("%s/audio.wav" % _local_path())
 
-	print("YOMIRecord: Writing frames to %s ..." % local_path)
+	print("YOMIRecord: Finishing video encode in %s ..." % _global_path())
 	OS.set_window_title("Your Only Move Is HUSTLE (Rendering)")
 	change_window_icon("rendering")
 	show_rendering_toast()
@@ -559,7 +668,8 @@ func post_recording():
 	var start_time = Time.get_ticks_msec()
 	Global.frame_advance = false
 
-	# Wait for frames to write
+	# Wait for the writer thread: it is done once every captured frame
+	# has gone to the video encoder over the socket.
 	var writer_state = _finish_writer(frames_length)
 	if writer_state is GDScriptFunctionState:
 		yield (writer_state, "completed")
@@ -571,94 +681,78 @@ func post_recording():
 	if not dir.dir_exists("user://recordings"):
 		dir.make_dir("user://recordings")
 
-	# Apply Resolution
-	var resolution = int(options.get_option("resolution"))
-	var res_size = "640x360"
-	if resolution != 360:
-		var resolution_scale = float(resolution) / float(get_viewport().size.y)
-		res_size = "%dx%d" % [int(ceil(get_viewport().size.x * resolution_scale)), int(get_viewport().size.y * resolution_scale)]
-		if resolution == 480: res_size = "854x480"
-
-	# Apply Format
-	var ffmpegExtraArgs = PoolStringArray()
 	var format = options.get_option("recording_format")
-	if format == "webm":
-		video_name += ".webm"
-		ffmpegExtraArgs.append_array([
-			"-c:v", "libvpx-vp9"
-		])
-	elif format == "avi":
-		video_name += ".avi"
-		ffmpegExtraArgs.append_array([
-			"-c:v", "mpeg4"
-		])
-	else:
-		video_name += ".mp4"
-		ffmpegExtraArgs.append_array([
-			"-c:v", "libx264",
-			"-preset", "veryslow"
-		])
-
-	# Apply Audio Effects
-	if not audio_muted:
-		var volume = float(options.get_option("volume")) / 100
-		if volume != 1:
-			ffmpegExtraArgs.append_array([
-				"-filter:a", "volume=%.2f" % volume
-			])
-		if options.get_option("normalize_audio"):
-			ffmpegExtraArgs.append_array([
-				"-filter:a", "dynaudnorm"
-			])
-	
-	# Change Video Speed
-	var framerate = 60
-	if get_native_speed() == null:
-		framerate = int(float(60) * options.get_option("speed"))
-		if framerate <= 0: framerate = 1
-		# https://superuser.com/a/1667260
-		if not audio_muted and framerate != 60:
-			ffmpegExtraArgs.append_array([
-				"-af", "asetrate=44100*%s,aresample=44100" % str(float(framerate) / 60)
-			])
-
-	# Run FFmpeg
+	video_name += ".%s" % format
 	var final_path = ProjectSettings.globalize_path("user://recordings/" + video_name)
-	var ffmpegArgs = PoolStringArray([
-		"-framerate", str(framerate),
-		"-i", "%s/%%d.png" % global_path
-	]);
-	if audio_muted:
-		ffmpegArgs.append_array(["-map", "0:v"])
-	else:
-		ffmpegArgs.append_array([
-			"-i", "%s/audio.wav" % global_path,
-			"-map", "0:v",
-			"-map", "1:a",
-			"-shortest"
-		])
-	ffmpegArgs.append_array([
-#		"-crf", "17", # 17-37 (37 is worst)
-		"-pix_fmt", "yuv420p",
-		"-vf", "vflip",
-		"-s", res_size,
-		"-sws_flags", "neighbor",
-		"-metadata", "title=" + usernames[0].replace('"', '\\"') + " vs " + usernames[1].replace('"', '\\"'),
-		"-metadata", "comment=Recording of Your Only Move Is Hustle [%s], created using Y.O.M.I Record" % Global.VERSION.replace('"', '\\"')
-	]);
-	print(ffmpegArgs)
-	var ffmpegCommand = PoolStringArray([ffmpegArgs.join(" "), ffmpegExtraArgs.join(" "), '"%s"' % final_path]).join(" ");
-	print("YOMIRecord: running command: %s " % ffmpegCommand, PoolStringArray([ffmpegArgs.join(" "), ffmpegExtraArgs.join(" "), '"%s"' % final_path]).join(" "))
-	var ffmpeg_thread = Thread.new()
-	var ffmpeg_data = [ffmpeg.ffmpeg_path, ffmpegArgs + ffmpegExtraArgs + PoolStringArray([final_path]), options.get_option("exec_console")]
-	update_rendering_toast("[color=#fff]FFmpeg is running...[/color]")
-	ffmpeg_thread.start(self, "_run_ffmpeg", ffmpeg_data)
-	while ffmpeg_thread.is_alive():
+	var video_only_path = _video_only_path(format)
+
+	# Wait for the video encoder. Most of the encode already ran while
+	# frames streamed in during capture (see _start_video_encoder()); this
+	# only waits out whatever backlog is left and the container's final
+	# write, so it is now the short part of the render.
+	update_rendering_toast("[color=#fff]FFmpeg is encoding video...[/color]")
+	while video_ffmpeg_thread.is_alive():
 		yield (get_tree(), "idle_frame")
-	var ffmpeg_result = ffmpeg_thread.wait_to_finish()
-	var exit_code = ffmpeg_result[0]
-	var output = ffmpeg_result[1]
-	print("YOMIRecord: ", output[0])
+	var video_result = video_ffmpeg_thread.wait_to_finish()
+	var exit_code = video_result[0]
+	var output = video_result[1]
+	print("YOMIRecord: ", output[0] if output.size() > 0 else "")
+	print("YOMIRecord: video encode finished with exit code %d" % exit_code)
+	if video_write_failed and exit_code == 0:
+		exit_code = 1
+
+	# Finalize: add the audio track (if any) with a fast "-c:v copy"
+	# remux instead of re-encoding the video a second time, and write the
+	# metadata tags. This runs even with audio removed, so the metadata
+	# still reaches the final file.
+	if exit_code == 0:
+		var ffmpegExtraArgs = PoolStringArray()
+		if not audio_muted:
+			var volume = float(options.get_option("volume")) / 100
+			if volume != 1:
+				ffmpegExtraArgs.append_array([
+					"-filter:a", "volume=%.2f" % volume
+				])
+			if options.get_option("normalize_audio"):
+				ffmpegExtraArgs.append_array([
+					"-filter:a", "dynaudnorm"
+				])
+			var framerate = _recording_framerate()
+			# https://superuser.com/a/1667260
+			if framerate != 60:
+				ffmpegExtraArgs.append_array([
+					"-af", "asetrate=44100*%s,aresample=44100" % str(float(framerate) / 60)
+				])
+
+		var ffmpegArgs = PoolStringArray(["-i", video_only_path])
+		if audio_muted:
+			ffmpegArgs.append_array(["-map", "0:v"])
+		else:
+			ffmpegArgs.append_array([
+				"-i", "%s/audio.wav" % _global_path(),
+				"-map", "0:v",
+				"-map", "1:a",
+				"-shortest"
+			])
+		ffmpegArgs.append_array([
+			"-c:v", "copy",
+			"-metadata", "title=" + usernames[0].replace('"', '\\"') + " vs " + usernames[1].replace('"', '\\"'),
+			"-metadata", "comment=Recording of Your Only Move Is Hustle [%s], created using Y.O.M.I Record" % Global.VERSION.replace('"', '\\"')
+		])
+		ffmpegArgs.append_array(ffmpegExtraArgs)
+		ffmpegArgs.append(final_path)
+		print("YOMIRecord: finalizing with command: ", ffmpegArgs)
+		update_rendering_toast("[color=#fff]FFmpeg is adding audio...[/color]")
+		var finalize_thread = Thread.new()
+		var finalize_data = [ffmpeg.ffmpeg_path, ffmpegArgs, options.get_option("exec_console")]
+		finalize_thread.start(self, "_run_ffmpeg", finalize_data)
+		while finalize_thread.is_alive():
+			yield (get_tree(), "idle_frame")
+		var finalize_result = finalize_thread.wait_to_finish()
+		exit_code = finalize_result[0]
+		output = finalize_result[1]
+		print("YOMIRecord: ", output[0] if output.size() > 0 else "")
+
 	print("YOMIRecord: Finished rendering with exit code %d" % exit_code)
 	hide_rendering_toast()
 
@@ -668,15 +762,15 @@ func post_recording():
 
 	# File Cleanup
 	if not options.get_option("skip_files"):
-		if dir.open(local_path) == OK:
+		if dir.open(_local_path()) == OK:
 			dir.list_dir_begin()
 			var file_name = dir.get_next()
 			while file_name != "":
 				if file_name != "." and file_name != ".." and not dir.current_is_dir():
-					dir.remove(local_path + "/" + file_name)
+					dir.remove(_local_path() + "/" + file_name)
 				file_name = dir.get_next()
-		dir.remove(local_path)
-	
+		dir.remove(_local_path())
+
 	# Variable Cleanup
 	recording_frame_skip = FRAME_SKIP
 	recording_end_buffer = END_BUFFER
@@ -685,7 +779,7 @@ func post_recording():
 		_remove_capture_effect()
 	else:
 		_remove_record_effect()
-	
+
 	OS.set_window_title("Your Only Move Is HUSTLE")
 	change_window_icon("normal")
 	OS.request_attention()
@@ -694,6 +788,7 @@ func post_recording():
 	stable_recording = false
 	writer_finished = false
 	rendering = false
+	video_server = null
 	emit_signal("recording_ended")
 	if exit_code == 0: spawn_file_toast("recording", video_name, time_elapsed, frames_length)
 
@@ -722,15 +817,29 @@ func record():
 		return true
 	return false
 
-func _thread_write(local_path):
+func _thread_write(server: TCP_Server):
+	var socket = _accept_video_connection(server)
+	server.stop()
+	if socket == null:
+		video_write_failed = true
+		return
+	socket.set_no_delay(true)
 	while true:
 		writer_thread_semaphore.wait()
 		if thread_counter_final > 0 && thread_counter_final == thread_counter_current:
-			return
+			break
 		var frame: Image = recording_frames[thread_counter_current]
-		frame.save_png("%s/%d.png" % [local_path, thread_counter_current])
+		if frame.get_format() != Image.FORMAT_RGBA8:
+			frame.convert(Image.FORMAT_RGBA8)
+		if socket.put_data(frame.get_data()) != OK:
+			push_error("YOMIRecord: lost the connection to the video encoder at frame %d" % thread_counter_current)
+			video_write_failed = true
+			recording_frames[thread_counter_current] = null
+			thread_counter_current += 1
+			break
 		recording_frames[thread_counter_current] = null
 		thread_counter_current += 1
+	socket.disconnect_from_host()
 
 func _physics_process(delta):
 	if not recording or stable_recording: return

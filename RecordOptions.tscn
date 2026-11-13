@@ -539,8 +539,8 @@ margin_top = 529.0
 margin_right = 236.0
 margin_bottom = 541.0
 rect_pivot_offset = Vector2( -430, 13 )
-hint_tooltip = "Skips a cleanup step where temporary PNG frames
-and WAV audio are deleted so you can use that for whatever.
+hint_tooltip = "Skips a cleanup step where the temporary video and WAV
+audio files are deleted so you can use them for whatever.
 
 (Temp folders are in the folder above screenshots/replays)"
 text = "Skip File Cleanup"
