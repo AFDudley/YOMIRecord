@@ -60,7 +60,7 @@ def probe(path: str) -> dict:
             "-v",
             "error",
             "-show_entries",
-            "format=duration:stream=codec_type,codec_name,width,height,nb_frames,duration",
+            "format=duration:stream=codec_type,codec_name,width,height,nb_frames,duration,duration_ts,sample_rate",
             "-of",
             "json",
             path,
@@ -84,7 +84,10 @@ def duration_check(probe_result: dict, recorded_frames: int | None) -> dict | No
 
     Returns None when either stream lacks a duration (so there is nothing
     to compare), else a dict with the two durations in ms, their
-    difference, and whether ffmpeg trimmed frames from the video.
+    difference, whether ffmpeg trimmed frames from the video, and the
+    audio sample count against the count the video's frame count implies
+    (see Recorder.gd's post_recording(), "target_samples": frames *
+    mix_rate / 60, before any speed-driven resampling).
     """
     streams = probe_result.get("streams", [])
     video = next((s for s in streams if s.get("codec_type") == "video"), None)
@@ -94,7 +97,7 @@ def duration_check(probe_result: dict, recorded_frames: int | None) -> dict | No
     video_ms = float(video["duration"]) * 1000.0
     audio_ms = float(audio["duration"]) * 1000.0
     video_frames = int(video.get("nb_frames", 0))
-    return {
+    result = {
         "video_ms": video_ms,
         "audio_ms": audio_ms,
         "diff_ms": abs(video_ms - audio_ms),
@@ -103,6 +106,14 @@ def duration_check(probe_result: dict, recorded_frames: int | None) -> dict | No
         "frames_trimmed": recorded_frames is not None
         and video_frames != recorded_frames,
     }
+    sample_rate = audio.get("sample_rate")
+    audio_samples = audio.get("duration_ts")
+    if recorded_frames is not None and sample_rate is not None and audio_samples is not None:
+        expected_samples = recorded_frames * int(sample_rate) // 60
+        result["audio_samples"] = int(audio_samples)
+        result["expected_audio_samples"] = expected_samples
+        result["audio_sample_diff"] = int(audio_samples) - expected_samples
+    return result
 
 
 def main() -> int:
@@ -235,7 +246,7 @@ def main() -> int:
     if args.stable == "1":
         dc = report["duration_check"]
         duration_ok = (
-            dc is not None and dc["diff_ms"] <= 50.0 and not dc["frames_trimmed"]
+            dc is not None and dc["diff_ms"] <= 2.0 and not dc["frames_trimmed"]
         )
 
     ok = (
