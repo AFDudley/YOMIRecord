@@ -476,15 +476,56 @@ func _global_path() -> String:
 func _video_only_path(format: String) -> String:
 	return "%s/video_only.%s" % [_global_path(), format]
 
+# Standard H.264 level limits (macroblocks/second, macroblocks/frame),
+# ITU-T H.264 Table A-1, levels 3.0 and up (anything this mod records is
+# well above level 2.x's frame sizes). _h264_level() picks the lowest
+# level that is legal for the chosen resolution and frame rate.
+const H264_LEVELS = [
+	["3.0", 40500, 1620],
+	["3.1", 108000, 3600],
+	["3.2", 216000, 5120],
+	["4.0", 245760, 8192],
+	["4.1", 245760, 8192],
+	["4.2", 522240, 8704],
+	["5.0", 589824, 22080],
+	["5.1", 983040, 36864],
+	["5.2", 2073600, 36864],
+	["6.0", 4177920, 139264],
+	["6.1", 8355840, 139264],
+	["6.2", 16711680, 139264],
+]
+
+func _h264_level(res_size: String, framerate: int) -> String:
+	var dims = res_size.split("x")
+	var mb_width = int(ceil(float(dims[0]) / 16.0))
+	var mb_height = int(ceil(float(dims[1]) / 16.0))
+	var mbs_per_frame = mb_width * mb_height
+	var mbs_per_sec = mbs_per_frame * framerate
+	for level in H264_LEVELS:
+		if mbs_per_frame <= level[2] and mbs_per_sec <= level[1]:
+			return level[0]
+	return H264_LEVELS[H264_LEVELS.size() - 1][0]
+
 # Same codec and preset post_recording() used to pass to ffmpeg. The
 # "-c:v" name here must match FORMAT_ENCODERS, which record() checks
 # before it lets a recording start.
-func _video_codec_args(format: String) -> PoolStringArray:
+#
+# "-preset veryslow" raises libx264's reference-frame count enough that,
+# left to pick its own level, it reports one far above what the chosen
+# resolution and frame rate need (measured: level 5.0 for plain
+# 1280x720, where 3.2 already covers 1280x720 at up to 60 fps). Some
+# hardware H.264 decoders mishandle that combination and corrupt the
+# picture (reported: smearing in VLC's hardware decoder on an NVIDIA
+# GPU; ffmpeg's own software decoder was unaffected). An explicit
+# "-level" makes libx264 clip its reference-frame count down to
+# whatever that level's buffer size allows, instead of raising the
+# level to fit the preset.
+func _video_codec_args(format: String, res_size: String, framerate: int) -> PoolStringArray:
 	if format == "webm":
 		return PoolStringArray(["-c:v", "libvpx-vp9"])
 	elif format == "avi":
 		return PoolStringArray(["-c:v", "mpeg4"])
-	return PoolStringArray(["-c:v", "libx264", "-preset", "veryslow"])
+	return PoolStringArray(["-c:v", "libx264", "-preset", "veryslow", "-level:v", _h264_level(res_size, framerate)])
 
 func _recording_resolution_size() -> String:
 	var resolution = int(options.get_option("resolution"))
@@ -549,7 +590,7 @@ func _start_video_encoder():
 		"-s", res_size,
 		"-sws_flags", "neighbor",
 	])
-	ffmpegArgs.append_array(_video_codec_args(format))
+	ffmpegArgs.append_array(_video_codec_args(format, res_size, framerate))
 	ffmpegArgs.append(_video_only_path(format))
 	print("YOMIRecord: starting video encoder with command: ", ffmpegArgs)
 	video_ffmpeg_thread = Thread.new()

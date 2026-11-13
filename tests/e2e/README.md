@@ -57,6 +57,18 @@ No per-frame image files exist in this pipeline, on disk or otherwise:
 `options.skip_files` now keeps the temporary `audio.wav` (and, if the
 video encode fails, a partial `video_only.*`) instead of PNG frames.
 
+`_video_codec_args()` also sets an explicit `-level` for the mp4
+(libx264) format, computed by `_h264_level()` from the chosen resolution
+and frame rate. Without it, `-preset veryslow`'s higher reference-frame
+count pushes libx264 to report a level far above what the resolution
+and frame rate need (plain 1280x720 at 60 fps measured level 5.0,
+against level 3.2's own limit of 1280x720 at 60 fps); some hardware
+H.264 decoders corrupt that combination (reported: smearing in VLC's
+hardware decoder on an NVIDIA GPU, with ffmpeg's software decoder
+unaffected). Passing an explicit level makes libx264 clip the
+reference-frame count down to what that level allows, instead of
+raising the level to fit the preset.
+
 ## Stable mode audio
 
 Stable mode (`options.stable_mode`) steps the game by hand to capture video
