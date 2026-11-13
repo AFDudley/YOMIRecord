@@ -7,9 +7,27 @@
 # to ffmpeg and getting a silent failure.
 #
 # e2e.sh puts this file's directory first on PATH, so the mod's "ffmpeg"
-# lookup finds this wrapper before the real binary.
+# lookup finds this wrapper before the real binary. This script finds the
+# real ffmpeg by searching the rest of PATH for it, instead of a fixed
+# path: the real ffmpeg's path is not the same in every container image
+# (the Nix-built image puts it at /bin/ffmpeg, a wrapper script of its
+# own; a Debian image would put it at /usr/bin/ffmpeg).
 set -eu
-REAL_FFMPEG=/usr/bin/ffmpeg
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REAL_FFMPEG=""
+OLD_IFS=$IFS
+IFS=:
+for dir in $PATH; do
+  if [ "$dir" != "$SELF_DIR" ] && [ -x "$dir/ffmpeg" ]; then
+    REAL_FFMPEG="$dir/ffmpeg"
+    break
+  fi
+done
+IFS=$OLD_IFS
+if [ -z "$REAL_FFMPEG" ]; then
+  echo "ffmpeg_no_libx264 wrapper: no other ffmpeg found on PATH" >&2
+  exit 1
+fi
 for arg in "$@"; do
   if [ "$arg" = "-encoders" ]; then
     "$REAL_FFMPEG" "$@" | grep -v libx264
